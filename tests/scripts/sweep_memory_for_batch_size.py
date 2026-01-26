@@ -52,11 +52,13 @@ def main() -> None:
 
     # Sanity check: estimating a huge batch shouldn't allocate real device memory.
     estimate_bytes = estimate_memory_from_batchsize(
-        models[MODEL_LIST[0]],
+        10_000,
+        model=models[MODEL_LIST[0]],
+        model_ref=MODEL_LIST[0],
         max_input_length=128,
         max_output_length=32,
         num_logits_per_token=8,
-        batch_size=10_000,
+        kind="on_device",
     )
 
     for model_repo, batch_size in tqdm(work_items):
@@ -72,11 +74,13 @@ def main() -> None:
             raise
         data = json.loads(result.stdout)
         estimate_bytes = estimate_memory_from_batchsize(
-            models[model_repo],
+            batch_size,
+            model=models[model_repo],
+            model_ref=model_repo,
             max_input_length=128,
             max_output_length=32,
             num_logits_per_token=8,
-            batch_size=batch_size,
+            kind="on_device",
         )
         rows.append(
             [

@@ -254,6 +254,7 @@ def estimate_batchsize(
         num_logits_per_token,
         mem,
         progress_callback,
+        kind="hybrid",
     )
 
     callbacks.finished_estimating_batchsize(bs)
