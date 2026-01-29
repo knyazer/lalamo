@@ -197,11 +197,14 @@ def _load_hf_model(
         gpu_devices = [d for d in jax.devices() if d.platform == "gpu"]
         if gpu_devices:
             gib = 1024**3
-            bytes_limit = gpu_devices[0].memory_stats().get("bytes_limit")
+            try:
+                bytes_limit = gpu_devices[0].memory_stats().get("bytes_limit")
+            except:
+                bytes_limit = 60 * gib
             if bytes_limit is not None:
                 safe_bytes = int(bytes_limit * 0.9)
                 safe_gib = max(1, safe_bytes // gib)
-                max_memory = {0: f"{safe_gib}GiB"}
+                max_memory = {0: f"{safe_gib}GiB", "cpu": "1000GiB"}
 
     model_kwargs: dict[str, Any] = {
         "dtype": dtype.torch_dtype if dtype is not None else None,

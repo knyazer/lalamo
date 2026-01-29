@@ -1,5 +1,6 @@
 import importlib.metadata
 import json
+import os
 from collections import ChainMap
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import huggingface_hub
+import jax
 import jax.numpy as jnp
 from jax import Array
 from jaxtyping import DTypeLike
@@ -23,7 +25,7 @@ from .decoder_configs import ForeignClassifierConfig, ForeignConfig, ForeignLMCo
 from .huggingface_generation_config import HFGenerationConfig, _policy_from_hf_config
 from .huggingface_tokenizer_config import HFTokenizerConfig
 from .model_specs import REPO_TO_MODEL, FileSpec, ModelSpec, ModelType, UseCase
-from .model_specs.common import JSONFieldSpec
+from .model_specs.common import JSONFieldSpec, WeightsType
 
 __all__ = [
     "REPO_TO_MODEL",
@@ -176,6 +178,24 @@ def import_message_processor(
     return MessageProcessor(config=message_processor_config, tokenizer=tokenizer)
 
 
+def _pick_loading_device(weights_paths: list[Path], weights_type: WeightsType) -> jax.Device | None:
+    """Pick CPU for large models, otherwise use JAX default (GPU)."""
+    force_cpu = os.getenv("LALAMO_LOAD_ON_CPU", "auto")
+    if force_cpu == "0":
+        return None
+    if force_cpu == "1":
+        return jax.devices("cpu")[0]
+
+    if weights_type == WeightsType.SAFETENSORS:
+        from lalamo.safetensors import total_safetensors_size
+
+        total_gib = total_safetensors_size(weights_paths) / (1024**3)
+        if total_gib > 40:
+            return jax.devices("cpu")[0]
+
+    return None
+
+
 def _load_main_processing_module(
     model_spec: ModelSpec,
     precision: DTypeLike,
@@ -185,11 +205,15 @@ def _load_main_processing_module(
     accumulation_precision: DTypeLike = jnp.float32,
 ) -> LalamoModule:
     weights_paths = download_weights(model_spec, progress_callback=progress_callback)
+    device = _pick_loading_device(weights_paths, model_spec.weights_type)
+
     with ExitStack() as stack:
         weights_shards = []
         metadata_shards = []
         for weights_path in weights_paths:
-            weights_shard, metadata_shard = stack.enter_context(model_spec.weights_type.load(weights_path, precision))
+            weights_shard, metadata_shard = stack.enter_context(
+                model_spec.weights_type.load(weights_path, precision, device=device),
+            )
             weights_shards.append(weights_shard)
             metadata_shards.append(metadata_shard)
         weights_dict: ChainMap[str, Array] = ChainMap(*weights_shards)

@@ -3,6 +3,7 @@ import struct
 from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BufferedReader, BufferedWriter
+from pathlib import Path
 from typing import Any, ClassVar, Self
 
 import cattrs
@@ -63,7 +64,11 @@ class SFTensorInfo:
         return self._converter.unstructure(self)
 
 
-def safe_read(fd: BufferedReader) -> tuple[dict[str, str] | None, LazyDict[str, Array]]:
+def safe_read(
+    fd: BufferedReader,
+    *,
+    device: jax.Device | None = None,
+) -> tuple[dict[str, str] | None, LazyDict[str, Array]]:
     header_size = struct.unpack("<Q", fd.read(8))[0]
     header: dict[str, dict[str, Any]] = json.loads(fd.read(header_size))
     metadata: dict[str, str] | None = header.pop("__metadata__", None)
@@ -72,10 +77,25 @@ def safe_read(fd: BufferedReader) -> tuple[dict[str, str] | None, LazyDict[str, 
     def _load_tensor(key: str) -> Array:
         info = SFTensorInfo.from_dict(header[key])
         fd.seek(data_offset + info.start)
-        return jnp.asarray(np.fromfile(fd, info.dtype, info.size // info.dtype.itemsize)).reshape(info.shape)
+        arr = jnp.asarray(np.fromfile(fd, info.dtype, info.size // info.dtype.itemsize)).reshape(info.shape)
+        if device is not None:
+            return jax.device_put(arr, device)
+        return arr
 
     lazy_tensors = LazyDict(set(header.keys()), _load_tensor)
     return (metadata, lazy_tensors)
+
+
+def total_safetensors_size(paths: list[Path | str]) -> int:
+    """Sum tensor data size across multiple safetensors files by reading headers only."""
+    total = 0
+    for path in paths:
+        with Path(path).open("rb") as fd:
+            header_size = struct.unpack("<Q", fd.read(8))[0]
+            header: dict[str, dict[str, Any]] = json.loads(fd.read(header_size))
+            header.pop("__metadata__", None)
+            total += sum(SFTensorInfo.from_dict(info).size for info in header.values())
+    return total
 
 
 def safe_write(fd: BufferedWriter, tensors: Mapping[str, Array]) -> None:

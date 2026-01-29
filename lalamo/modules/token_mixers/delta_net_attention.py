@@ -249,9 +249,9 @@ class DeltaNetAttention(TokenMixerBase[DeltaNetAttentionConfig, SSMStateLayer]):
         if positional_embeddings is not None:
             raise ValueError("Positional embeddings are not supported for DeltaNetAttention.")
 
-        q, k, v, gate, b, a = vmap(self.in_proj)(inputs)
-        mixed_qkv = jnp.concatenate([q, k, v], axis=-1)
-        beta = jax.nn.sigmoid(b)
+        proj_query, proj_key, proj_value, gate, beta_logits, decay_input = vmap(self.in_proj)(inputs)
+        mixed_qkv = jnp.concatenate([proj_query, proj_key, proj_value], axis=-1)
+        beta = jax.nn.sigmoid(beta_logits)
 
         if state is None:
             state = SSMStateLayer.init(
@@ -277,7 +277,7 @@ class DeltaNetAttention(TokenMixerBase[DeltaNetAttentionConfig, SSMStateLayer]):
 
         # since we work with exponentials, we (possibly?) uplift dtype to make sure numbers are nice
         decay_factor = -jnp.exp(self.a_log.astype(jnp.float32)) * jax.nn.softplus(
-            (a + self.dt_bias).astype(jnp.float32),
+            (decay_input + self.dt_bias).astype(jnp.float32),
         )
         decay_factor = decay_factor.astype(inputs.dtype)
 
@@ -308,14 +308,7 @@ class DeltaNetAttention(TokenMixerBase[DeltaNetAttentionConfig, SSMStateLayer]):
         )
 
         def norm_gate(x: Float[Array, " channels"], gate: Float[Array, " channels"]) -> Float[Array, " channels"]:
-            input_dtype = x.dtype
-            x_up = x.astype(self.norm.config.accumulation_precision)
-            variance = jnp.mean(jnp.square(x_up), axis=-1, keepdims=True)
-            x_norm = x_up * jax.lax.rsqrt(variance + self.norm.config.epsilon)
-            x_norm = x_norm.astype(input_dtype)
-            scaled = x_norm * self.norm.scales.astype(input_dtype)
-            gated = scaled * jax.nn.silu(gate.astype(jnp.float32))
-            return gated.astype(input_dtype)
+            return self.norm(x) * jax.nn.silu(gate.astype(jnp.float32)).astype(x.dtype)
 
         gate = gate.reshape(gate.shape[0], self.num_heads, self.value_head_dim)
         core_attn_out = jax.vmap(jax.vmap(norm_gate))(core_attn_out, gate)

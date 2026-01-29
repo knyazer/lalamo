@@ -184,36 +184,31 @@ class HFQwen3NextConfig(HuggingFaceLMConfig):
                 activation_precision=activation_precision,
             )
 
-        experts_config = DenseMLPConfig(
-            linear_config=linear_config,
-            activation=SiLU(),
-            has_up_biases=False,
-            has_down_biases=False,
-            up_clipping=None,
-            gate_clipping=None,
-        )
-        shared_expert_config = DenseMLPConfig(
-            linear_config=linear_config,
-            activation=SiLU(),
-            has_up_biases=False,
-            has_down_biases=False,
-            up_clipping=None,
-            gate_clipping=None,
-        )
-        moe_config = MixtureOfExpertsConfig(
-            mixture_size=self.num_experts,
-            num_experts_per_token=(self.num_experts_per_tok or 1),
-            routing_function=SoftmaxRouting(),
-            router_config=linear_config,
-            router_has_biases=False,
-            expert_config=experts_config,
-            gate_config=linear_config,
-            shared_expert_config=shared_expert_config,
-            gate_applies_to_shared_experts=True,
-            num_shared_experts=1,
-            expert_hidden_dim=self.moe_intermediate_size,
-            shared_expert_hidden_dim=self.shared_expert_intermediate_size,
-        )
+        moe_config: MixtureOfExpertsConfig | None = None
+        if self.num_experts > 0:
+            assert self.shared_expert_intermediate_size == self.moe_intermediate_size, (
+                f"shared_expert_intermediate_size ({self.shared_expert_intermediate_size}) "
+                f"must equal moe_intermediate_size ({self.moe_intermediate_size})"
+            )
+            experts_config = DenseMLPConfig(
+                linear_config=linear_config,
+                activation=SiLU(),
+                has_up_biases=False,
+                has_down_biases=False,
+                up_clipping=None,
+                gate_clipping=None,
+            )
+            moe_config = MixtureOfExpertsConfig(
+                mixture_size=self.num_experts + 1,
+                num_experts_per_token=(self.num_experts_per_tok or 1),
+                routing_function=SoftmaxRouting(),
+                router_config=linear_config,
+                router_has_biases=False,
+                expert_config=experts_config,
+                gate_config=linear_config,
+                num_shared_experts=1,
+                expert_hidden_dim=self.moe_intermediate_size,
+            )
 
         layer_types = [
             ("full_attention" if (i + 1) % self.full_attention_interval == 0 else "linear_attention")
@@ -257,8 +252,10 @@ class HFQwen3NextConfig(HuggingFaceLMConfig):
                     partial_rope_dim=int(self.head_dim * self.partial_rotary_factor),
                 )
 
-            if (layer_idx not in self.mlp_only_layers) and (
-                self.num_experts > 0 and (layer_idx + 1) % self.decoder_sparse_step == 0
+            if (
+                moe_config is not None
+                and layer_idx not in self.mlp_only_layers
+                and (layer_idx + 1) % self.decoder_sparse_step == 0
             ):
                 mlp_config = moe_config
             else:

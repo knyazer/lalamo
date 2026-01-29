@@ -299,7 +299,7 @@ def load_mlp(
 
 
 def load_moe(module: MixtureOfExperts, weights_dict: Mapping[str, Array], path: ParameterPath) -> MixtureOfExperts:
-    # Load router via the standard linear loader
+    # Load router via the standard linear loader.
     # Qwen-MoE often names the router layer "gate" in HF weights.
     if (path / "router.weight") in weights_dict or (path / "router.qweight") in weights_dict:
         router_path = path / "router"
@@ -309,66 +309,10 @@ def load_moe(module: MixtureOfExperts, weights_dict: Mapping[str, Array], path: 
         router_path = path / "router"
     router = load_linear(module.router, weights_dict, router_path)
 
-    def load_expert_stack(
-        experts_module: DenseMLP,
-        experts_path: ParameterPath,
-        mixture_size: int,
-        *,
-        indexed: bool = True,
-    ) -> DenseMLP:
-        if not indexed and mixture_size != 1:
-            raise ValueError("Unindexed expert weights require mixture_size == 1.")
-        up_weights = []
-        gate_weights = []
-        down_weights = []
-        up_biases = [] if experts_module.up_projection.has_biases else None
-        gate_biases = [] if experts_module.up_projection.has_biases else None
-        down_biases = [] if experts_module.down_projection.has_biases else None
-
-        for idx in range(mixture_size):
-            expert_path = experts_path / str(idx) if indexed else experts_path
-            up_weights.append(weights_dict[expert_path / "up_proj.weight"])
-            gate_weights.append(weights_dict[expert_path / "gate_proj.weight"])
-            down_weights.append(weights_dict[expert_path / "down_proj.weight"])
-            if up_biases is not None:
-                # up_biases and gate_biases are created in lockstep from the same flag.
-                assert gate_biases is not None
-                up_biases.append(weights_dict[expert_path / "up_proj.bias"])
-                gate_biases.append(weights_dict[expert_path / "gate_proj.bias"])
-            if down_biases is not None:
-                down_biases.append(weights_dict[expert_path / "down_proj.bias"])
-
-        up_w = jnp.stack(up_weights, axis=0)
-        gate_w = jnp.stack(gate_weights, axis=0)
-        combined_up_gate_w = jnp.concatenate([up_w, gate_w], axis=1)
-        if up_biases is None:
-            combined_up_gate_b = None
-        else:
-            # up_biases and gate_biases are created in lockstep from the same flag.
-            assert gate_biases is not None
-            up_b = jnp.stack(up_biases, axis=0)
-            gate_b = jnp.stack(gate_biases, axis=0)
-            combined_up_gate_b = jnp.concatenate([up_b, gate_b], axis=1)
-
-        up_projection = load_parameters(
-            lambda m: (m.weights, m.biases),
-            experts_module.up_projection,
-            (combined_up_gate_w, combined_up_gate_b),
-        )
-
-        down_w = jnp.stack(down_weights, axis=0)
-        down_b = jnp.stack(down_biases, axis=0) if down_biases is not None else None
-        down_projection = load_parameters(
-            lambda m: (m.weights, m.biases),
-            experts_module.down_projection,
-            (down_w, down_b),
-        )
-
-        return load_parameters(
-            lambda m: (m.up_projection, m.down_projection),
-            experts_module,
-            (up_projection, down_projection),
-        )
+    num_routed = module.num_routed_experts
+    num_shared = module.num_shared_experts
+    has_up_biases = module.experts.up_projection.has_biases
+    has_down_biases = module.experts.down_projection.has_biases
 
     experts_path = path / "experts"
     # GPT-OSS uses fused MXFP4 expert weights; detect and decode those.
@@ -380,36 +324,40 @@ def load_moe(module: MixtureOfExperts, weights_dict: Mapping[str, Array], path: 
             flatten=False,
         )
         fused_eio = rearrange(fused, "e o ib ie -> e (ib ie) o")
-        up_w, gate_w = deinterleave_pairwise_columns(fused_eio, first="odd")
-        combined_up_gate_w = jnp.swapaxes(jnp.concatenate([up_w, gate_w], axis=-1), -1, -2)
+        up_weights, gate_weights = deinterleave_pairwise_columns(fused_eio, first="odd")
+        combined_up_gate_weights = jnp.swapaxes(
+            jnp.concatenate([up_weights, gate_weights], axis=-1), -1, -2,
+        )
 
-        gub = weights_dict[experts_path / "gate_up_proj_bias"]
-        if gub.ndim == 1:
-            gub = jnp.broadcast_to(gub, (combined_up_gate_w.shape[0], gub.shape[0]))
-        up_b, gate_b = deinterleave_pairwise_columns(gub, first="odd")
-        combined_up_gate_b = jnp.concatenate([up_b + 1.0, gate_b], axis=-1)
+        gate_up_bias = weights_dict[experts_path / "gate_up_proj_bias"]
+        if gate_up_bias.ndim == 1:
+            gate_up_bias = jnp.broadcast_to(
+                gate_up_bias, (combined_up_gate_weights.shape[0], gate_up_bias.shape[0]),
+            )
+        up_bias, gate_bias = deinterleave_pairwise_columns(gate_up_bias, first="odd")
+        combined_up_gate_biases = jnp.concatenate([up_bias + 1.0, gate_bias], axis=-1)
 
         up_projection = load_parameters(
             lambda m: (m.weights, m.biases),
             module.experts.up_projection,
-            (combined_up_gate_w, combined_up_gate_b),
+            (combined_up_gate_weights, combined_up_gate_biases),
         )
 
-        down_w = decode_mxfp4(
+        down_weights = decode_mxfp4(
             weights_dict[experts_path / "down_proj_blocks"],
             weights_dict[experts_path / "down_proj_scales"],
             dtype=module.activation_precision,
             flatten=False,
         )
-        down_w = rearrange(down_w, "e o ib ie -> e o (ib ie)")
-        down_b = weights_dict[experts_path / "down_proj_bias"]
-        if down_b.ndim == 1:
-            down_b = jnp.broadcast_to(down_b, (*down_w.shape[:-1], down_b.shape[0]))
+        down_weights = rearrange(down_weights, "e o ib ie -> e o (ib ie)")
+        down_biases = weights_dict[experts_path / "down_proj_bias"]
+        if down_biases.ndim == 1:
+            down_biases = jnp.broadcast_to(down_biases, (*down_weights.shape[:-1], down_biases.shape[0]))
 
         down_projection = load_parameters(
             lambda m: (m.weights, m.biases),
             module.experts.down_projection,
-            (down_w, down_b),
+            (down_weights, down_biases),
         )
 
         experts = load_parameters(
@@ -418,30 +366,68 @@ def load_moe(module: MixtureOfExperts, weights_dict: Mapping[str, Array], path: 
             (up_projection, down_projection),
         )
     else:
-        experts = load_expert_stack(module.experts, experts_path, module.mixture_size)
+        # Collect expert weight paths: routed experts first, then shared experts.
+        expert_paths: list[ParameterPath] = [experts_path / str(idx) for idx in range(num_routed)]
 
-    shared_experts = None
-    if module.shared_experts is not None:
-        shared_mixture_size = module.shared_experts.mixture_size
-        assert shared_mixture_size is not None
-        if (path / "shared_expert" / "up_proj.weight") in weights_dict:
-            if shared_mixture_size != 1:
-                raise ValueError("Shared expert weights are unindexed but num_shared_experts != 1.")
-            shared_path = path / "shared_expert"
-            shared_experts = load_expert_stack(
-                module.shared_experts,
-                shared_path,
-                shared_mixture_size,
-                indexed=False,
-            )
-        elif (path / "shared_experts" / "0" / "up_proj.weight") in weights_dict:
-            shared_experts = load_expert_stack(
-                module.shared_experts,
-                path / "shared_experts",
-                shared_mixture_size,
-            )
+        if num_shared > 0:
+            if (path / "shared_expert" / "up_proj.weight") in weights_dict:
+                if num_shared != 1:
+                    raise ValueError("Single shared expert path found but num_shared_experts != 1.")
+                expert_paths.append(path / "shared_expert")
+            elif (path / "shared_experts" / "0" / "up_proj.weight") in weights_dict:
+                for idx in range(num_shared):
+                    expert_paths.append(path / "shared_experts" / str(idx))
+            else:
+                raise KeyError("Could not find shared expert weights in HF checkpoint.")
+
+        up_weight_list: list[Array] = []
+        gate_weight_list: list[Array] = []
+        down_weight_list: list[Array] = []
+        up_bias_list: list[Array] | None = [] if has_up_biases else None
+        gate_bias_list: list[Array] | None = [] if has_up_biases else None
+        down_bias_list: list[Array] | None = [] if has_down_biases else None
+
+        for expert_path in expert_paths:
+            up_weight_list.append(weights_dict[expert_path / "up_proj.weight"])
+            gate_weight_list.append(weights_dict[expert_path / "gate_proj.weight"])
+            down_weight_list.append(weights_dict[expert_path / "down_proj.weight"])
+            if up_bias_list is not None:
+                assert gate_bias_list is not None
+                up_bias_list.append(weights_dict[expert_path / "up_proj.bias"])
+                gate_bias_list.append(weights_dict[expert_path / "gate_proj.bias"])
+            if down_bias_list is not None:
+                down_bias_list.append(weights_dict[expert_path / "down_proj.bias"])
+
+        stacked_up = jnp.stack(up_weight_list, axis=0)
+        stacked_gate = jnp.stack(gate_weight_list, axis=0)
+        combined_up_gate_weights = jnp.concatenate([stacked_up, stacked_gate], axis=1)
+        if up_bias_list is None:
+            combined_up_gate_biases = None
         else:
-            raise KeyError("Could not find shared expert weights in HF checkpoint.")
+            assert gate_bias_list is not None
+            stacked_up_biases = jnp.stack(up_bias_list, axis=0)
+            stacked_gate_biases = jnp.stack(gate_bias_list, axis=0)
+            combined_up_gate_biases = jnp.concatenate([stacked_up_biases, stacked_gate_biases], axis=1)
+
+        up_projection = load_parameters(
+            lambda m: (m.weights, m.biases),
+            module.experts.up_projection,
+            (combined_up_gate_weights, combined_up_gate_biases),
+        )
+
+        stacked_down = jnp.stack(down_weight_list, axis=0)
+        stacked_down_biases = jnp.stack(down_bias_list, axis=0) if down_bias_list is not None else None
+        down_projection = load_parameters(
+            lambda m: (m.weights, m.biases),
+            module.experts.down_projection,
+            (stacked_down, stacked_down_biases),
+        )
+
+        experts = load_parameters(
+            lambda m: (m.up_projection, m.down_projection),
+            module.experts,
+            (up_projection, down_projection),
+        )
 
     gate = None
     if module.gate is not None:
@@ -455,9 +441,9 @@ def load_moe(module: MixtureOfExperts, weights_dict: Mapping[str, Array], path: 
         gate = load_linear(module.gate, weights_dict, gate_path)
 
     return load_parameters(
-        lambda m: (m.router, m.experts, m.shared_experts, m.gate),
+        lambda m: (m.router, m.experts, m.gate),
         module,
-        (router, experts, shared_experts, gate),
+        (router, experts, gate),
     )
 
 

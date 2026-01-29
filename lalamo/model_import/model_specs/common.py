@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, ClassVar, cast, get_args, get_origin
 
 import cattrs
+import jax
 import jax.numpy as jnp
 from jaxtyping import Array, DTypeLike
 
@@ -52,10 +53,12 @@ class WeightsType(Enum):
         self,
         filename: Path | str,
         float_dtype: DTypeLike,
+        *,
+        device: jax.Device | None = None,
     ) -> Iterator[tuple[Mapping[str, jnp.ndarray], Mapping[str, str]]]:
         if self == WeightsType.SAFETENSORS:
             with Path(filename).open("rb") as fd:
-                (metadata_dict, weights_dict) = safe_read(fd)
+                (metadata_dict, weights_dict) = safe_read(fd, device=device)
                 yield MapDictValues(lambda v: cast_if_float(v, float_dtype), weights_dict), metadata_dict or {}
         else:
             import torch

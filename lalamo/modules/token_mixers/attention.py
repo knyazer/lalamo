@@ -4,7 +4,7 @@ from typing import Self
 
 import equinox as eqx
 import jax
-from einops import einsum, rearrange, repeat
+from einops import einsum, rearrange
 from jax import numpy as jnp
 from jax import vmap
 from jaxtyping import Array, Bool, DTypeLike, Float, Int, PRNGKeyArray
@@ -30,11 +30,7 @@ def _repeat_kv(
     keys_or_values: Float[Array, "tokens groups channels"],
     group_size: int,
 ) -> Float[Array, "tokens groups*group_size channels"]:
-    return repeat(
-        keys_or_values,
-        "tokens groups channels -> tokens (groups group_size) channels",
-        group_size=group_size,
-    )
+    return jnp.repeat(keys_or_values, group_size, axis=1)
 
 
 def _soft_capped_attention_kernel(
@@ -353,11 +349,14 @@ class Attention(TokenMixerBase[AttentionConfig, KVCacheLayer]):
         return_updated_state: bool = False,
         length_without_padding: Int[Array, ""] | int | None = None,
     ) -> AttentionResult:
-        q_out, keys, values, *gate_out = vmap(self.qkv_projection, in_axes=0)(inputs)
-        gate = gate_out[0] if gate_out else None
+        if self.config.has_gate:
+            queries, keys, values, gate = vmap(self.qkv_projection, in_axes=0)(inputs)
+        else:
+            queries, keys, values = vmap(self.qkv_projection, in_axes=0)(inputs)
+            gate = None
 
         queries = rearrange(
-            q_out,
+            queries,
             "tokens (heads head_channels) -> tokens heads head_channels",
             heads=self.num_heads,
             head_channels=self.head_dim,
